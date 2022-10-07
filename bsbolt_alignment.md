@@ -1,4 +1,4 @@
-#BSBolt WGBS sequencing alignments
+# BSBolt WGBS sequencing alignments
 
 The following code needs to be run for each of the paired read files.
 
