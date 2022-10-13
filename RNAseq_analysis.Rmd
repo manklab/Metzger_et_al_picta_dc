@@ -1,0 +1,216 @@
+# RNAseq analysis for P. picta gonad, liver, head, and muscle
+
+Trim data using trimmomatic
+
+```bash
+for file in *001.fastq.gz ; do if [[ "$file" ==  *"R1"* ]] ; then name=`echo $file | grep -o "[A-Za-z].*_R"` ; f1=$name\1_001.fastq.gz ; f2=$name\2_001.fastq.gz ; trimmomatic PE -threads 20 -phred33 -trimlog $name\trim.log $f1  $f2 $name\1_Paried.fastq.gz $name\1_Unparied.fastq.gz $name\2_Paried.fastq.gz $name\2_Unparied.fastq.gz ILLUMINACLIP:picta_adaptors.fa:2:30:10 SLIDINGWINDOW:4:15 MINLEN:50 HEADCROP:10 CROP:120 ; fi; done
+```
+
+Sort .fastq files
+```bash
+for file in *_Paired.fastq ; do name=`echo $file | grep -o "[A-Za-z].*"` ; f1=$name ; f2=${name::-6}_sorted.fastq ; cat $f1 | paste - - - - | sort -k1,1 -t " " | tr "\t" "\n" > $f2 ; done
+```
+
+
+Align reads to genome using hisat2
+
+```bash
+hisat2-build -p 20 Poecilia_picta.RepeatMasked.fasta picta_genome_index
+
+
+for file in *Paired.fastq ; do if [[ "$file" ==  *"R1"* ]] ; then name=`echo $file | grep -o "[A-Za-z].*_R"` ; f1=$name\1_Paired.fastq ; f2=$name\2_Paired.fastq; f3=${name%?}hisat.bam; hisat2 -p 20 -x picta_genome_index -1 $f1 -2 $f2 | samtools view -bS - > $f3; fi ; done
+
+```
+
+
+
+Assign mapped reads to genic regions using featurecounts
+
+```bash
+##Convert the Dovetail gff tile to a gtf file using kentutils
+gff3ToGenePred Poecilia_picta.annotation.gff Poecilia_picta.annotation.genePred
+
+genePredToGtf file Poecilia_picta.annotation.genePred Poecilia_picta.annotation.gtf
+
+featureCounts -T 20 -p -s 0 -t gene -g ID -G Poecilia_picta.RepeatMasked.fasta --donotsort -a Poecilia_picta.annotation.gff -o picta_counts.txt *sorted.bam
+```
+
+
+
+Calculate expression values for each gene using edgeR
+```{R}
+library(edgeR)
+library(gdata)
+library(rtracklayer)
+GTF <- readGFF("Poecilia_picta.annotation.gff")
+
+picta.counts<-read.table("picta_counts.txt",sep="\t",header=TRUE)
+row.names(picta.counts)<-picta.counts$Geneid
+groups<-factor(c("A","A","A","B","B","B"))
+design<-model.matrix(~groups)
+
+#### Run the following code for each tissue to processes read counts using edgeR
+counts<-picta.counts[,c(1:6,25:30)]
+colnames(counts)<-c("Geneid","Chr","Start","End","Strand","Length","F1","F2","F3","M1","M2","M3")
+picta.dge<-DGEList(counts[,7:12],group=groups,genes=gonad.counts[,1],remove.zeros=TRUE)
+keep<-(rowSums(cpm(picta.dge$counts[,1:3]))>=0.675 | rowSums(cpm(picta.dge$counts[,4:6]))>=0.675) #filter out gene with low counts (~10 reads)
+picta.dge<-picta.dge[keep,keep.lib.sizes=FALSE]
+picta.dge<-calcNormFactors(picta.dge, method="RLE")
+picta.dge<-estimateDisp(picta.dge,design,robust=TRUE)
+picta.dge<-estimateGLMRobustDisp(picta.dge, design)
+picta.cpm<-as.data.frame(edgeR::cpm(picta.dge,normalized.lib.sizes = TRUE,log=FALSE))
+```
+
+
+The following code will run the quantile analysis on an individual tissue.
+
+```{R}
+library(gdata)
+library(rtracklayer)
+library(ggplot2)
+library(tidyr)
+library(gapminder)
+GTF <- readGFF("Poecilia_picta.annotation.gff")
+###Quantile analysis
+head.cpm<-read.table("picta_head_cpm.csv",row.names=1,sep=",",header=TRUE)
+
+head.cpm$female<-rowMeans(head.cpm[,c(1:3)])
+head.cpm$male<-rowMeans(head.cpm[,c(4:6)])
+head.cpm$mean<-rowMeans(head.cpm[,c(1:6)])
+head.cpm$ID<-row.names(head.cpm)
+head.quant<-quantile(head.cpm$male,c(0.25,0.5,0.75))
+
+q1<-head.cpm[head.cpm$mean<=head.quant[1],]
+q2<-head.cpm[(head.cpm$mean>head.quant[1] & head.cpm$mean<=head.quant[2]),]
+q3<-head.cpm[(head.cpm$mean>head.quant[2] & head.cpm$mean<=head.quant[3]),]
+q4<-head.cpm[head.cpm$mean>head.quant[3],]
+
+q1$quant<-"Q1"
+q2$quant<-"Q2"
+q3$quant<-"Q3"
+q4$quant<-"Q4"
+
+head.quantile<-rbind(q1,q2,q3,q4)
+head.quantile<-as.data.frame(merge(head.quantile,GTF[,c(1,4,5,9,10)],by="ID"))
+
+
+head.quantile$chr <- ifelse(head.quantile$seqid=="chr12", "Sex", "Autosome")
+
+
+
+
+head.quantile %>%
+  gather(key = "sex",
+         value = "expression",
+         female,male) %>%
+  unite("SC", sex:chr) %>%
+  ggplot(aes(x=quant, y=log2(expression), fill=SC, color=SC)) +
+  geom_boxplot(notch=TRUE,outlier.shape = NA,width=0.9,lwd=0.2) +
+  theme_classic() +
+  scale_fill_manual(values=c("grey90","#CC4040","grey90","#5B5BDD")) +
+  scale_color_manual(values=c("#CC4040","black","#5B5BDD","black")) +
+  coord_cartesian(ylim = c(-6,10)) +
+  theme(legend.position="none", text=element_text(size=20,color="black"),axis.line = element_line(size=0.5,colour = "black"))+
+  ggtitle("Head") +
+  theme(plot.title = element_text(hjust = 0.05, vjust = -5))+
+  xlab("Quantile") + ylab(expression(log[2] (cpm)))+
+  scale_x_discrete(labels=c("Q1" = "1", "Q2" = "2", "Q3" = "3", "Q4" = "4"))
+```
+
+
+Compare cpm expression  between male and female X and autosomal genes in all tissues
+
+```{R}
+library(gdata)
+library(rtracklayer)
+library(ggplot2)
+library(tidyr)
+library(gapminder)
+
+GTF <- readGFF("/Users/guppy/Documents/picta_genome/Annotation/PO1787_Poecilia_picta.annotation.gff")
+head.cpm<-read.table("/Users/guppy/Documents/picta_RNAseq/picta_head_cpm.csv",row.names=1,sep=",",header=TRUE)
+liver.cpm<-read.table("/Users/guppy/Documents/picta_RNAseq/picta_liver_cpm.csv",row.names=1,sep=",",header=TRUE)
+gonad.cpm<-read.table("/Users/guppy/Documents/picta_RNAseq/picta_gonad_cpm.csv",row.names=1,sep=",",header=TRUE)
+muscle.cpm<-read.table("/Users/guppy/Documents/picta_RNAseq/picta_muscle_cpm.csv",row.names=1,sep=",",header=TRUE)
+
+head.cpm$female<-rowMeans(head.cpm[,c(1:3)])
+head.cpm$male<-rowMeans(head.cpm[,c(4:6)])
+head.cpm$mean<-rowMeans(head.cpm[,c(1:6)])
+head.cpm$ID<-row.names(head.cpm)
+
+liver.cpm$female<-rowMeans(liver.cpm[,c(1:3)])
+liver.cpm$male<-rowMeans(liver.cpm[,c(4:6)])
+liver.cpm$mean<-rowMeans(liver.cpm[,c(1:6)])
+liver.cpm$ID<-row.names(liver.cpm)
+
+gonad.cpm$female<-rowMeans(gonad.cpm[,c(1:3)])
+gonad.cpm$male<-rowMeans(gonad.cpm[,c(4:6)])
+gonad.cpm$mean<-rowMeans(gonad.cpm[,c(1:6)])
+gonad.cpm$ID<-row.names(gonad.cpm)
+
+muscle.cpm$female<-rowMeans(muscle.cpm[,c(1:3)])
+muscle.cpm$male<-rowMeans(muscle.cpm[,c(4:6)])
+muscle.cpm$mean<-rowMeans(muscle.cpm[,c(1:6)])
+muscle.cpm$ID<-row.names(muscle.cpm)
+
+head.cpm$tissue<-"head"
+liver.cpm$tissue<-"liver"
+muscle.cpm$tissue<-"muscle"
+gonad.cpm$tissue<-"gonad"
+
+head.dc<-as.data.frame(merge(head.cpm,GTF[,c(1,9)],by="ID"))
+liver.dc<-as.data.frame(merge(liver.cpm,GTF[,c(1,9)],by="ID"))
+muscle.dc<-as.data.frame(merge(muscle.cpm,GTF[,c(1,9)],by="ID"))
+gonad.dc<-as.data.frame(merge(gonad.cpm,GTF[,c(1,9)],by="ID"))
+
+
+dc.box<-rbind(head.dc[,c(1,8:12)],liver.dc[,c(1,8:12)],muscle.dc[,c(1,7:11)],gonad.dc[,c(1,8:12)])
+
+dc.box$chr <- ifelse(dc.box$seqid=="chr12", "Sex", "Autosome")
+
+dc.box<-dc.box[dc.box$mean>(0.05*mean(dc.box$mean)),] #remove low expression genes < 5% of the mean
+dc.box<-dc.box[dc.box$mean<(quantile(dc.box$mean,probs=c(0.9999))),] #remove genes with high expression > 99.99 percentile
+
+dc.box %>%
+  gather(key = "sex",
+         value = "expression",
+         female,male) %>%
+  tidyr::unite("SC", chr:sex, remove = FALSE) %>%
+  tidyr::unite("TSC", tissue,SC, remove = FALSE) %>%
+  ggplot(aes(x=TSC, y=log2(expression), fill=TSC, color=TSC)) +
+  geom_boxplot(notch=TRUE,outlier.shape = NA,width=0.9,lwd=0.2) +
+  theme_classic() +
+  scale_fill_manual(values=rep(c("grey90","grey90","#CC4040","#5B5BDD"),4)) +
+  scale_color_manual(values=rep(c("#CC4040","#5B5BDD","black","black"),4)) +
+  coord_cartesian(ylim = c(-3,12)) +
+  facet_grid(~factor(tissue, labels = c('Gonad', 'Head', 'Liver', 'Muscle')), scales = 'free', switch = 'x') +
+  scale_x_discrete(name="", labels=c("gonad_Autosome_female"= expression("\u{2640}"[A]),
+                                     "gonad_Autosome_male"= expression("\u{2642}"[A]),
+                                     "gonad_Sex_female"= expression("\u{2640}"[X]),
+                                     "gonad_Sex_male"= expression("\u{2642}"[X]),
+                                     "head_Autosome_female"= expression("\u{2640}"[A]),
+                                     "head_Autosome_male"= expression("\u{2642}"[A]),
+                                     "head_Sex_female"= expression("\u{2640}"[X]),
+                                     "head_Sex_male"= expression("\u{2642}"[X]),
+                                     "liver_Autosome_female"= expression("\u{2640}"[A]),
+                                     "liver_Autosome_male"= expression("\u{2642}"[A]),
+                                     "liver_Sex_female"= expression("\u{2640}"[X]),
+                                     "liver_Sex_male"= expression("\u{2640}"[X]),
+                                     "muscle_Autosome_female"= expression("\u{2640}"[A]),
+                                     "muscle_Autosome_male"= expression("\u{2642}"[A]),
+                                     "muscle_Sex_female"= expression("\u{2640}"[X]),
+                                     "muscle_Sex_male"= expression("\u{2642}"[X]))) +
+  ylab(expression(log[2](cpm)))+
+  theme(legend.position="none", text=element_text(size=15,color="black"),axis.line = element_line(size=0.3,colour = "black"),
+        strip.background = element_blank(), strip.placement = 'outside', axis.text = element_text(size = unit(20, 'points')),
+        strip.text = element_text(size = unit(20, 'points')))
+```
+
+
+
+
+
+
+
+
+```
